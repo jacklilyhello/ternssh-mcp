@@ -1,0 +1,71 @@
+name: Pull request checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  macos-approval:
+    runs-on: macos-15
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: tools/macos-approval
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test immutable batch validation and display
+        run: swift test
+      - name: Build hardened approval app for Apple Silicon
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift build -c release --arch arm64
+          bin_dir=$(swift build -c release --arch arm64 --show-bin-path)
+          app="$RUNNER_TEMP/TernSSHApproval.app"
+          mkdir -p "$app/Contents/MacOS"
+          install -m 755 "$bin_dir/TernSSHApproval" "$app/Contents/MacOS/TernSSHApproval"
+          install -m 644 Info.plist "$app/Contents/Info.plist"
+          codesign --force --sign - --options runtime --identifier dev.ternssh.CommandApproval "$app"
+          codesign --verify --strict "$app"
+          codesign -dr - "$app"
+          expected_hash=$(codesign -dv --verbose=4 "$app" 2>&1 | sed -n 's/^CDHash=//p')
+          actual_hash=$("$app/Contents/MacOS/TernSSHApproval" verify-build | jq -er '.cdhash')
+          test -n "$expected_hash" && test "$actual_hash" = "$expected_hash"
+
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install locked dependencies
+        run: |
+          npm ci --prefix server --no-audit --no-fund
+          npm ci --prefix web --no-audit --no-fund
+
+      - name: Check server types
+        run: server/node_modules/.bin/tsc -p server/tsconfig.json --noEmit
+
+      - name: Build frontend
+        run: npm run build --prefix web
+
+      - name: Run regression tests
+        shell: bash
+        env:
+          TERNSSH_WORKSPACE_CI: "1"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install --no-install-recommends -y openssh-sftp-server bubblewrap busybox-static libseccomp2 coreutils python3
+          server/node_modules/.bin/tsx --test
